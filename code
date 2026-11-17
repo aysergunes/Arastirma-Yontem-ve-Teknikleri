@@ -1,0 +1,512 @@
+
+import sys
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 50)
+pd.set_option("display.max_rows", 100)
+
+
+DOSYA_ADI = "temizlenmis_tablo.xlsx"
+YARIS_KM = 42.195
+
+# Ara_Sure_1 = start mat'ına geçiş (silah-saati farkı). Ara_Sure_2..10 = km noktaları.
+
+SPLIT_KM = {
+    "Ara_Sure_2": 5.0,
+    "Ara_Sure_3": 10.0,
+    "Ara_Sure_4": 15.0,
+    "Ara_Sure_5": 20.0,
+    "Ara_Sure_6": 21.0975,   # yarı maraton noktası
+    "Ara_Sure_7": 25.0,
+    "Ara_Sure_8": 25.7,
+    "Ara_Sure_9": 30.0,
+    "Ara_Sure_10": 35.0,
+}
+START_COL = "Ara_Sure_1"
+HALF_COL = "Ara_Sure_6"
+KM5_COL = "Ara_Sure_2"
+
+EXCLUDE_DISTANCES = {"Unused"}          # analize alınmayacak mesafe etiketleri
+MIN_KULUP_SPORCU = 3                    # kulüp ortalaması için asgari bitiren sayısı
+
+# Split sınıflandırması: oran = 2. yarı süresi / 1. yarı süresi
+NEG_ESIK = 0.99      # < 0.99  -> negatif split
+DENGE_ESIK = 1.03    # 0.99-1.03 -> dengeli
+POZ_ESIK = 1.10      # 1.03-1.10 -> pozitif ; >1.10 -> çöküş
+
+SURE_GRUPLARI = [0, 3 * 3600, 3.5 * 3600, 4 * 3600, 4.5 * 3600, 5 * 3600, 99 * 3600]
+SURE_ETIKET = ["<3:00", "3:00-3:30", "3:30-4:00", "4:00-4:30", "4:30-5:00", "5:00+"]
+
+
+
+def sn_cevir(x):
+    """'H:MM:SS' -> saniye. DNF/DQ/boş -> NaN"""
+    if not isinstance(x, str):
+        return np.nan
+    m = re.fullmatch(r"\s*(\d+):(\d{1,2}):(\d{1,2})\s*", x)
+    if not m:
+        return np.nan
+    h, mi, s = map(int, m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def sn_yaz(sn):
+    """saniye -> 'H:MM:SS'"""
+    if pd.isna(sn):
+        return ""
+    sn = int(round(sn))
+    return f"{sn // 3600}:{(sn % 3600) // 60:02d}:{sn % 60:02d}"
+
+
+def tempo_yaz(sn_km):
+    """sn/km -> 'M:SS /km'"""
+    if pd.isna(sn_km):
+        return ""
+    sn_km = int(round(sn_km))
+    return f"{sn_km // 60}:{sn_km % 60:02d}"
+
+
+def zaman_formatla(df, kolonlar):
+    d = df.copy()
+    for c in kolonlar:
+        if c in d.columns:
+            d[c] = d[c].map(sn_yaz)
+    return d
+
+
+def baslik(t):
+    print("\n" + "=" * 100)
+    print(t)
+    print("=" * 100)
+
+
+def dosya_bul():
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1]).expanduser()
+    adaylar = [
+        Path(__file__).resolve().parent / DOSYA_ADI if "__file__" in globals() else None,
+        Path.cwd() / DOSYA_ADI,
+        Path.home() / "Desktop" / DOSYA_ADI,
+        Path.home() / "Masaüstü" / DOSYA_ADI,
+        Path.home() / "OneDrive" / "Desktop" / DOSYA_ADI,
+        Path.home() / "OneDrive" / "Masaüstü" / DOSYA_ADI,
+        Path("/mnt/user-data/uploads") / DOSYA_ADI,
+    ]
+    for a in adaylar:
+        if a is not None and a.exists():
+            return a
+    sys.exit(f"'{DOSYA_ADI}' bulunamadı. Dosya yolunu argüman olarak verin: python oku.py <yol>")
+
+
+
+def veri_yukle(yol):
+    ham = pd.read_excel(yol, dtype=str)
+    ham.columns = [c.strip() for c in ham.columns]
+    n_ham = len(ham)
+
+    # Boş satırlar ve tablonun altına yapıştırılmış artık satırlar atılır
+    df = ham[ham["Distance"].notna() & ham["GogusNo"].notna()].copy()
+    atilan_bos = n_ham - len(df)
+
+    df = df[~df["Distance"].isin(EXCLUDE_DISTANCES)].copy()
+    atilan_dist = (n_ham - atilan_bos) - len(df)
+
+    for c in ["Distance", "Affiliation", "Category"]:
+        df[c] = df[c].astype(str).str.strip()
+
+    # Süreleri saniyeye çevir
+    df["gun_sn"] = df["GunTime"].map(sn_cevir)
+    df["net_sn"] = df["Mattime"].map(sn_cevir)
+    for c in [START_COL] + list(SPLIT_KM):
+        df[c + "_sn"] = df[c].map(sn_cevir)
+
+    # Durum
+    df["Durum"] = np.where(df["net_sn"].notna(), "Bitirdi",
+                           df["Mattime"].fillna("Bilinmiyor").astype(str).str.upper())
+
+    # Kategoriden cinsiyet ve yaş grubu türet
+    df["Cinsiyet"] = df["Category"].str[0].where(df["Category"].str[0].isin(["M", "F"]), "?")
+    yas = df["Category"].str.extract(r"([0-9]{2}.*)$")[0]
+    df["YasGrubu"] = yas.fillna("Genel (yaş yok)")
+
+    # Net-çip bazlı ara süreler /start mat'ı çıkarma
+    for c in SPLIT_KM:
+        df[c + "_net"] = df[c + "_sn"] - df[START_COL + "_sn"]
+
+    print(f"Okunan satır: {n_ham}  |  boş/artık satır atıldı: {atilan_bos}  |  "
+          f"hariç tutulan mesafe: {atilan_dist}  |  analiz edilen: {len(df)}")
+    print(df["Durum"].value_counts().to_string())
+    return df
+
+
+
+# ORTAK ÖZET FONKSİYONU
+
+def sure_ozeti(g):
+    fin = g.loc[g["net_sn"].notna(), "net_sn"]
+    return pd.Series({
+        "Katilimci": len(g),
+        "Bitiren": len(fin),
+        "Bitirme_%": round(100 * len(fin) / len(g), 1) if len(g) else np.nan,
+        "Ort_Net": fin.mean(),
+        "Medyan_Net": fin.median(),
+        "En_Iyi": fin.min(),
+        "En_Yavas": fin.max(),
+        "Std_dk": fin.std() / 60 if len(fin) > 1 else np.nan,
+    })
+
+
+ZAMAN_KOLONLARI = ["Ort_Net", "Medyan_Net", "En_Iyi", "En_Yavas"]
+
+
+def grup_ozeti(df, anahtar):
+    o = df.groupby(anahtar).apply(sure_ozeti, include_groups=False)
+    o["Pay_%"] = (100 * o["Katilimci"] / o["Katilimci"].sum()).round(1)
+    return o
+
+
+
+# 1) TEKİL ANALİZLER
+
+def tekil_analizler(df, sonuc):
+    baslik("1A) KATEGORİYE (Category) GÖRE")
+    kat = grup_ozeti(df, "Category").sort_values("Katilimci", ascending=False)
+    kat_g = zaman_formatla(kat, ZAMAN_KOLONLARI)
+    print(kat_g.to_string())
+    sonuc["1A_Kategori"] = kat_g.reset_index()
+
+    baslik("1A-2) Türetilen: Cinsiyet ve Yaş Grubu")
+    cin = zaman_formatla(grup_ozeti(df, "Cinsiyet"), ZAMAN_KOLONLARI)
+    yas = zaman_formatla(grup_ozeti(df, "YasGrubu"), ZAMAN_KOLONLARI)
+    print(cin.to_string(), "\n")
+    print(yas.to_string())
+    sonuc["1A2_Cinsiyet"] = cin.reset_index()
+    sonuc["1A3_YasGrubu"] = yas.reset_index()
+
+    baslik("1B) KULÜBE / TAKIMA (Affiliation) GÖRE")
+    rows = []
+    for aff, g in df.groupby("Affiliation"):
+        fin = g.loc[g["net_sn"].notna(), "net_sn"].sort_values()
+        rows.append({
+            "Affiliation": aff,
+            "Katilimci": len(g),
+            "Bitiren": len(fin),
+            "Bitirme_%": round(100 * len(fin) / len(g), 1),
+            "En_Iyi": fin.min() if len(fin) else np.nan,
+            "Ort_Net": fin.mean() if len(fin) else np.nan,
+            "Medyan_Net": fin.median() if len(fin) else np.nan,
+            "Ilk3_Ort": fin.head(3).mean() if len(fin) >= 3 else np.nan,
+        })
+    aff = pd.DataFrame(rows)
+    # Genel başarı: en iyi dereceye göre sıralama ve ilk3 ortalaması
+    aff["Sira_EnIyi"] = aff["En_Iyi"].rank(method="min")
+    aff["Sira_Ilk3"] = aff["Ilk3_Ort"].rank(method="min")
+    aff = aff.sort_values(["Katilimci"], ascending=False)
+    aff_g = zaman_formatla(aff, ["En_Iyi", "Ort_Net", "Medyan_Net", "Ilk3_Ort"])
+    print("En kalabalık 15:")
+    print(aff_g.head(15).to_string(index=False))
+    print(f"\nEn iyi derece sıralaması (ilk 15):")
+    print(zaman_formatla(aff.sort_values("En_Iyi").head(15),
+                         ["En_Iyi", "Ort_Net", "Medyan_Net", "Ilk3_Ort"]).to_string(index=False))
+    print(f"\nİlk-3 ortalaması sıralaması (en az {MIN_KULUP_SPORCU} bitiren, ilk 15):")
+    print(zaman_formatla(aff[aff["Bitiren"] >= MIN_KULUP_SPORCU].sort_values("Ilk3_Ort").head(15),
+                         ["En_Iyi", "Ort_Net", "Medyan_Net", "Ilk3_Ort"]).to_string(index=False))
+    sonuc["1B_Kulup"] = aff_g
+
+    baslik("1C) MESAFEYE (Distance) GÖRE")
+    mes = zaman_formatla(grup_ozeti(df, "Distance"), ZAMAN_KOLONLARI)
+    print(mes.to_string())
+    if df["Distance"].nunique() == 1:
+        print(f"\nNOT: Veride yalnızca tek mesafe var ({df['Distance'].iloc[0]}). "
+              "Mesafe kırılımlı analizler tek satır/sütun üretecektir.")
+    sonuc["1C_Mesafe"] = mes.reset_index()
+
+    # Grafik: kategori dağılımı ve ortalama süre
+    k = kat.sort_values("Katilimci", ascending=False)
+    k = k[k["Katilimci"] >= 1]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.bar(k.index, k["Katilimci"], color="#4C78A8")
+    ax.set_ylabel("Katılımcı")
+    ax.tick_params(axis="x", rotation=45)
+    ax2 = ax.twinx()
+    ax2.plot(k.index, k["Ort_Net"] / 3600, color="#E45756", marker="o")
+    ax2.set_ylabel("Ortalama net süre (saat)")
+    ax.set_title("Kategoriye göre katılımcı sayısı ve ortalama bitiş süresi")
+    fig.tight_layout()
+    fig.savefig(CIKTI / "01_kategori.png", dpi=130)
+    plt.close(fig)
+
+    top = aff.sort_values("Katilimci", ascending=False).head(15)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(top["Affiliation"], top["Katilimci"], color="#54A24B")
+    ax.set_title("En kalabalık 15 kulüp/takım (Affiliation)")
+    ax.set_ylabel("Katılımcı")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    fig.savefig(CIKTI / "02_kulup.png", dpi=130)
+    plt.close(fig)
+
+
+
+# 2) İKİLİ / ÜÇLÜ KOMBİNASYONLAR
+
+def ikili_uclu(df, sonuc):
+    baslik("2A) KATEGORİ + MESAFE")
+    adet = pd.crosstab(df["Category"], df["Distance"], margins=True, margins_name="Toplam")
+    print("Katılımcı sayısı:")
+    print(adet.to_string())
+    yuzde = (pd.crosstab(df["Category"], df["Distance"], normalize="columns") * 100).round(1)
+    print("\nMesafe içinde kategori payı (%):")
+    print(yuzde.to_string())
+    ort = df[df["net_sn"].notna()].pivot_table(index="Category", columns="Distance",
+                                                values="net_sn", aggfunc="mean")
+    ort_g = ort.map(sn_yaz)
+    print("\nOrtalama net süre:")
+    print(ort_g.to_string())
+    sonuc["2A_Kat_Mesafe_Adet"] = adet.reset_index()
+    sonuc["2A_Kat_Mesafe_Pay"] = yuzde.reset_index()
+    sonuc["2A_Kat_Mesafe_Sure"] = ort_g.reset_index()
+
+    baslik("2B) KULÜP + KATEGORİ")
+    top_kulup = df["Affiliation"].value_counts().head(10).index
+    sub = df[df["Affiliation"].isin(top_kulup)]
+    adet2 = pd.crosstab(sub["Affiliation"], sub["Category"], margins=True, margins_name="Toplam")
+    print("En kalabalık 10 kulübün kategori dağılımı (sporcu sayısı):")
+    print(adet2.to_string())
+
+    # Kategori içi sıralama
+    fin = df[df["net_sn"].notna()].copy()
+    fin["kat_sira"] = fin.groupby("Category")["net_sn"].rank(method="min")
+    fin["kat_ilk10"] = fin["kat_sira"] <= 10
+    guc = (fin.groupby(["Affiliation", "Category"])
+              .agg(Bitiren=("net_sn", "size"), Ort_Net=("net_sn", "mean"),
+                   En_Iyi=("net_sn", "min"), Kat_Ilk10=("kat_ilk10", "sum"),
+                   Ort_Kat_Sira=("kat_sira", "mean"))
+              .reset_index())
+    guc["Ort_Kat_Sira"] = guc["Ort_Kat_Sira"].round(1)
+    guc_g = zaman_formatla(guc, ["Ort_Net", "En_Iyi"])
+    print("\nKulübün kategori içi gücü (kategori ilk-10 sayısı, ort. kategori sırası):")
+    print(guc_g.sort_values(["Kat_Ilk10", "Bitiren"], ascending=False).head(20).to_string(index=False))
+    sonuc["2B_Kulup_Kat_Adet"] = adet2.reset_index()
+    sonuc["2B_Kulup_Kat_Guc"] = guc_g.sort_values(["Kat_Ilk10", "Bitiren"], ascending=False)
+
+    return fin
+
+
+def kategori_ara_zaman(df, sonuc):
+    baslik("2C) ARA ZAMAN (5 km, yarı, bitiş) + KATEGORİ  -  kim hızlı başladı, kim istikrarlı koştu?")
+    d = df[df["net_sn"].notna() & df[KM5_COL + "_net"].notna() & df[HALF_COL + "_net"].notna()].copy()
+    d["tempo_5k"] = d[KM5_COL + "_net"] / SPLIT_KM[KM5_COL]            # sn/km
+    d["tempo_bitis"] = d["net_sn"] / YARIS_KM                           # sn/km (ortalama)
+    d["ilk_yari"] = d[HALF_COL + "_net"]
+    d["ikinci_yari"] = d["net_sn"] - d["ilk_yari"]
+    d["split_orani"] = d["ikinci_yari"] / d["ilk_yari"]
+    d["hizli_baslangic_%"] = (d["tempo_bitis"] / d["tempo_5k"] - 1) * 100   # +: ilk 5K ortalamadan hızlı
+
+    rows = []
+    for kat, g in d.groupby("Category"):
+        r = {
+            "Category": kat,
+            "N": len(g),
+            "Ort_5K_tempo": g["tempo_5k"].mean(),
+            "Ort_Bitis_tempo": g["tempo_bitis"].mean(),
+            "Hizli_Baslangic_%": g["hizli_baslangic_%"].mean(),
+            "Ort_Split_Orani": g["split_orani"].mean(),
+            "Negatif_Split_%": 100 * (g["split_orani"] < 1).mean(),
+            "Korelasyon_5K_Bitis": g["tempo_5k"].corr(g["net_sn"]) if len(g) > 2 else np.nan,
+        }
+        rows.append(r)
+    t = pd.DataFrame(rows).sort_values("N", ascending=False)
+    for c in ["Ort_5K_tempo", "Ort_Bitis_tempo"]:
+        t[c] = t[c].map(tempo_yaz)
+    t = t.round(3)
+    print("(tempo: dk:sn/km | Hizli_Baslangic_% : ilk 5 km, yarış ortalama temposundan % kaç hızlı)")
+    print(t.to_string(index=False))
+    print(f"\nGenel korelasyon (5K tempo vs bitiş süresi): {d['tempo_5k'].corr(d['net_sn']):.3f}")
+    sonuc["2C_AraZaman_Kategori"] = t
+
+    # Başlangıç tipi: kim hızlı başladı?
+    d["Baslangic_Tipi"] = pd.cut(d["hizli_baslangic_%"], [-np.inf, -2, 2, np.inf],
+                                 labels=["Yavaş başladı (>%2)", "Dengeli", "Hızlı başladı (>%2)"])
+    ct = pd.crosstab(d["Category"], d["Baslangic_Tipi"], normalize="index").mul(100).round(1)
+    print("\nKategoriye göre başlangıç tipi dağılımı (%):")
+    print(ct.to_string())
+    sonuc["2C_Baslangic_Tipi"] = ct.reset_index()
+    return d
+
+
+
+# 3) BÜTÜNSEL ANALİZ
+
+def gun_vs_mat(df, sonuc):
+    baslik("3A) GunTime vs Mattime  -  start çizgisi yoğunluğu (silah - çip farkı)")
+    d = df[df["net_sn"].notna() & df["gun_sn"].notna()].copy()
+    d["fark_sn"] = d["gun_sn"] - d["net_sn"]
+    print(f"Hesaplanan sporcu: {len(d)}")
+    print(f"Negatif fark (veri hatası olabilir): {(d['fark_sn'] < 0).sum()}")
+    ozet = d["fark_sn"].describe(percentiles=[.1, .25, .5, .75, .9, .95, .99]).round(1)
+    print(ozet.to_string())
+    d["Sure_Grubu"] = pd.cut(d["net_sn"], SURE_GRUPLARI, labels=SURE_ETIKET, right=False)
+    grup = (d.groupby("Sure_Grubu", observed=True)["fark_sn"]
+              .agg(["count", "mean", "median", "max"]).round(1))
+    grup.columns = ["Sporcu", "Ort_Fark_sn", "Medyan_Fark_sn", "Maks_Fark_sn"]
+    print("\nBitiş süresi grubuna göre start farkı (sn):")
+    print(grup.to_string())
+    kor = d["fark_sn"].corr(d["net_sn"])
+    kor_sp = d["fark_sn"].rank().corr(d["net_sn"].rank())   # Spearman (scipy gerektirmez)
+    print(f"\nFark ile net süre korelasyonu: Pearson {kor:.3f} | Spearman {kor_sp:.3f}")
+    print(f"Ortalama fark / net süre: %{100 * (d['fark_sn'] / d['net_sn']).mean():.2f}")
+    print(f"Farkı 60 sn'yi aşan sporcu oranı: %{100 * (d['fark_sn'] > 60).mean():.1f}")
+    sonuc["3A_GunMat_Ozet"] = ozet.reset_index()
+    sonuc["3A_GunMat_Grup"] = grup.reset_index()
+
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4.5))
+    ust = d["fark_sn"].quantile(0.99)
+    axs[0].hist(d["fark_sn"].clip(upper=ust), bins=50, color="#4C78A8")
+    axs[0].set_title("Silah - çip farkı dağılımı (sn, %99'a kırpıldı)")
+    axs[0].set_xlabel("sn")
+    axs[1].scatter(d["net_sn"] / 3600, d["fark_sn"].clip(upper=ust), s=6, alpha=.4, color="#E45756")
+    axs[1].set_title("Bitiş süresi - start farkı")
+    axs[1].set_xlabel("Net süre (saat)")
+    axs[1].set_ylabel("sn")
+    fig.tight_layout()
+    fig.savefig(CIKTI / "03_gun_vs_mat.png", dpi=130)
+    plt.close(fig)
+
+
+def tempo_analizi(df, d_split, sonuc):
+    baslik("3B) TEMPO ANALİZİ (Split Times)  -  negatif / pozitif split eğilimi")
+
+    # --- Bölüm (segment) tempoları
+    sira = [START_COL] + list(SPLIT_KM)
+    km = {START_COL: 0.0, **SPLIT_KM}
+    fin = df[df["net_sn"].notna()].copy()
+    fin[START_COL + "_net"] = 0.0
+    fin["BITIS_net"] = fin["net_sn"]
+    noktalar = list(SPLIT_KM) + ["BITIS"]
+    km["BITIS"] = YARIS_KM
+    onceki = START_COL
+    seg_rows, seg_tempo = [], pd.DataFrame(index=fin.index)
+    for nokta in noktalar:
+        a = (fin[onceki + "_net"] if onceki != START_COL else pd.Series(0.0, index=fin.index))
+        b = fin[nokta + "_net"]
+        mesafe = km[nokta] - km[onceki]
+        isim = f"{km[onceki]:g}-{km[nokta]:g} km"
+        tempo = (b - a) / mesafe
+        tempo[(tempo < 120) | (tempo > 900)] = np.nan         # imkansız değerleri ele
+        seg_tempo[isim] = tempo
+        seg_rows.append({"Bolum": isim, "Mesafe_km": round(mesafe, 2), "N": tempo.notna().sum(),
+                         "Ort_Tempo": tempo.mean(), "Medyan_Tempo": tempo.median()})
+        onceki = nokta
+    seg = pd.DataFrame(seg_rows)
+    seg_g = seg.copy()
+    seg_g["Ort_Tempo"] = seg_g["Ort_Tempo"].map(tempo_yaz)
+    seg_g["Medyan_Tempo"] = seg_g["Medyan_Tempo"].map(tempo_yaz)
+    print("Tüm bitirenler için bölüm tempoları (dk:sn / km):")
+    print(seg_g.to_string(index=False))
+    sonuc["3B_Bolum_Tempo"] = seg_g
+
+    # --- Sürelere göre normalize tempo profili
+    fin["Sure_Grubu"] = pd.cut(fin["net_sn"], SURE_GRUPLARI, labels=SURE_ETIKET, right=False)
+    kendi_ort = fin["net_sn"] / YARIS_KM
+    norm = seg_tempo.div(kendi_ort, axis=0)
+    prof = norm.groupby(fin["Sure_Grubu"], observed=True).mean().mul(100).round(1)
+    print("\nBitiş grubuna göre bölüm tempo endeksi (100 = kişinin kendi ortalama temposu; >100 yavaş):")
+    print(prof.T.to_string())
+    sonuc["3B_Tempo_Endeksi"] = prof.T.reset_index().rename(columns={"index": "Bolum"})
+
+    # --- Split oranı
+    s = fin[fin[HALF_COL + "_net"].notna()].copy()
+    s["ilk"] = s[HALF_COL + "_net"]
+    s["ikinci"] = s["net_sn"] - s["ilk"]
+    s["oran"] = s["ikinci"] / s["ilk"]
+    s = s[(s["oran"] > 0.5) & (s["oran"] < 3)]
+    s["Tip"] = pd.cut(s["oran"], [0, NEG_ESIK, DENGE_ESIK, POZ_ESIK, np.inf],
+                      labels=["Negatif split", "Dengeli", "Pozitif split", "Çöküş (>%10)"], right=False)
+    tip = s["Tip"].value_counts().reindex(["Negatif split", "Dengeli", "Pozitif split", "Çöküş (>%10)"])
+    tip_df = pd.DataFrame({"Sporcu": tip, "Yuzde": (100 * tip / tip.sum()).round(1)})
+    print(f"\nSplit tipi dağılımı (N={len(s)}, oran = 2. yarı / 1. yarı):")
+    print(tip_df.to_string())
+    print(f"\nOrtalama split oranı: {s['oran'].mean():.3f} | medyan: {s['oran'].median():.3f}")
+    print(f"Ortalama 1. yarı: {sn_yaz(s['ilk'].mean())} | ortalama 2. yarı: {sn_yaz(s['ikinci'].mean())}")
+    print(f"Negatif split yapan (2. yarı < 1. yarı): %{100 * (s['oran'] < 1).mean():.1f}")
+
+    s_grup = (s.groupby("Sure_Grubu", observed=True)
+                .agg(N=("oran", "size"), Ort_Oran=("oran", "mean"),
+                     Negatif_Pct=("oran", lambda x: 100 * (x < 1).mean()))
+                .round(3))
+    print("\nBitiş grubuna göre split oranı:")
+    print(s_grup.to_string())
+    s_kat = (s.groupby("Category")
+               .agg(N=("oran", "size"), Ort_Oran=("oran", "mean"),
+                    Negatif_Pct=("oran", lambda x: 100 * (x < 1).mean()))
+               .round(3).sort_values("N", ascending=False))
+    print("\nKategoriye göre split oranı:")
+    print(s_kat.to_string())
+    sonuc["3B_Split_Tip"] = tip_df.reset_index()
+    sonuc["3B_Split_SureGrubu"] = s_grup.reset_index()
+    sonuc["3B_Split_Kategori"] = s_kat.reset_index()
+
+    # --- Grafikler
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for g, satir in prof.iterrows():
+        ax.plot(satir.index, satir.values, marker="o", label=str(g))
+    ax.axhline(100, color="gray", ls="--")
+    ax.set_title("Bölüm tempo endeksi (100 = kişinin kendi ortalaması)")
+    ax.set_ylabel("Endeks (>100 = yavaşlama)")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend(title="Bitiş süresi")
+    fig.tight_layout()
+    fig.savefig(CIKTI / "04_tempo_profili.png", dpi=130)
+    plt.close(fig)
+
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4.5))
+    axs[0].hist(s["oran"].clip(0.8, 1.6), bins=60, color="#72B7B2")
+    axs[0].axvline(1, color="red", ls="--")
+    axs[0].set_title("Split oranı (2. yarı / 1. yarı)")
+    axs[0].set_xlabel("1'in altı = negatif split")
+    ana = s["Category"].value_counts()
+    ana = ana[ana >= 10].index
+    veri = [s.loc[s["Category"] == k, "oran"].clip(0.8, 1.8) for k in ana]
+    axs[1].boxplot(veri, tick_labels=list(ana), showfliers=False)
+    axs[1].axhline(1, color="red", ls="--")
+    axs[1].tick_params(axis="x", rotation=45)
+    axs[1].set_title("Kategoriye göre split oranı")
+    fig.tight_layout()
+    fig.savefig(CIKTI / "05_split_orani.png", dpi=130)
+    plt.close(fig)
+
+
+
+# ANA AKIŞ
+
+if __name__ == "__main__":
+    yol = dosya_bul()
+    CIKTI = yol.parent / "analiz_ciktilari"
+    CIKTI.mkdir(exist_ok=True)
+    print(f"Dosya: {yol}\nÇıktı klasörü: {CIKTI}")
+
+    df = veri_yukle(yol)
+    sonuc = {}
+
+    tekil_analizler(df, sonuc)
+    ikili_uclu(df, sonuc)
+    d_split = kategori_ara_zaman(df, sonuc)
+    gun_vs_mat(df, sonuc)
+    tempo_analizi(df, d_split, sonuc)
+
+    excel_yolu = CIKTI / "analiz_sonuclari.xlsx"
+    with pd.ExcelWriter(excel_yolu, engine="openpyxl") as w:
+        for ad, tablo in sonuc.items():
+            tablo.to_excel(w, sheet_name=ad[:31], index=False)
+    baslik("TAMAMLANDI")
+    print(f"Tablolar : {excel_yolu}")
+    print(f"Grafikler: {CIKTI}")
